@@ -1,0 +1,18 @@
+# 进入本地项目
+cd "/Users/weisu/Ruishan_Multiorgan/UNETR++/unetr_plus_plus-main"
+
+# 看改了什么
+git status
+
+# 添加并提交
+git add .
+git commit -m "your message"
+
+# 推送到 GitHub main
+git push origin main
+
+# 进入 CARC 上的 git 项目目录
+cd /project2/ruishanl_1185/zrui6736/Ruishan_Multiorgan_UNETR_new
+
+# 拉最新
+git pull origin main
