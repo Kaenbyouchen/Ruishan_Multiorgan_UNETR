@@ -1,0 +1,12 @@
+# datasets / outputs
+DATASET_*/
+output_*/
+unetr_pp/results/
+*.nii
+*.nii.gz
+*.npz
+*.npy
+*.pkl
+# python
+__pycache__/
+*.pyc
