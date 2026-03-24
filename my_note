@@ -6,9 +6,7 @@ git status
 
 # 添加并提交
 git add .
-git commit -m "your message"
-
-# 推送到 GitHub main
+git commit -m "adding amos mri"
 git push origin main
 
 # 进入 CARC 上的 git 项目目录
