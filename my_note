@@ -6,7 +6,7 @@ git status
 
 # 添加并提交
 git add .
-git commit -m "adding amos mri"
+git commit -m "adding amos mri evaluation"
 git push origin main
 
 # 进入 CARC 上的 git 项目目录
