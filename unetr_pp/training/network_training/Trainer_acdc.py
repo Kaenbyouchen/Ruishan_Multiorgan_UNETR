@@ -15,7 +15,7 @@
 
 import shutil
 from collections import OrderedDict
-from multiprocessing import Pool
+from multiprocessing import Pool, get_context
 from time import sleep
 from typing import Tuple, List
 
@@ -130,6 +130,9 @@ class Trainer_acdc(NetworkTrainer_acdc):
 
         self.conv_per_stage = None
         self.regions_class_order = None
+        # Keep default export behavior for existing trainers unless overridden.
+        self.export_pool_context = None
+        self.export_pool_maxtasksperchild = None
 
     def update_fold(self, fold):
         """
@@ -581,60 +584,75 @@ class Trainer_acdc(NetworkTrainer_acdc):
 
         pred_gt_tuples = []
 
-        export_pool = Pool(default_num_threads)
+        if self.export_pool_context is not None:
+            export_pool = get_context(self.export_pool_context).Pool(
+                processes=max(default_num_threads, 1),
+                maxtasksperchild=self.export_pool_maxtasksperchild
+            )
+        else:
+            export_pool = Pool(default_num_threads)
         results = []
 
-        for k in self.dataset_val.keys():
-            properties = load_pickle(self.dataset[k]['properties_file'])
-            fname = properties['list_of_data_files'][0].split("/")[-1][:-12]
-            if overwrite or (not isfile(join(output_folder, fname + ".nii.gz"))) or \
-                    (save_softmax and not isfile(join(output_folder, fname + ".npz"))):
-                data = np.load(self.dataset[k]['data_file'])['data']
+        try:
+            for k in self.dataset_val.keys():
+                properties = load_pickle(self.dataset[k]['properties_file'])
+                fname = properties['list_of_data_files'][0].split("/")[-1][:-12]
+                if overwrite or (not isfile(join(output_folder, fname + ".nii.gz"))) or \
+                        (save_softmax and not isfile(join(output_folder, fname + ".npz"))):
+                    data = np.load(self.dataset[k]['data_file'])['data']
 
-                print(k, data.shape)
-                data[-1][data[-1] == -1] = 0
+                    print(k, data.shape)
+                    data[-1][data[-1] == -1] = 0
 
-                softmax_pred = self.predict_preprocessed_data_return_seg_and_softmax(data[:-1],
-                                                                                     do_mirroring=do_mirroring,
-                                                                                     mirror_axes=mirror_axes,
-                                                                                     use_sliding_window=use_sliding_window,
-                                                                                     step_size=step_size,
-                                                                                     use_gaussian=use_gaussian,
-                                                                                     all_in_gpu=all_in_gpu,
-                                                                                     mixed_precision=self.fp16)[1]
+                    softmax_pred = self.predict_preprocessed_data_return_seg_and_softmax(data[:-1],
+                                                                                         do_mirroring=do_mirroring,
+                                                                                         mirror_axes=mirror_axes,
+                                                                                         use_sliding_window=use_sliding_window,
+                                                                                         step_size=step_size,
+                                                                                         use_gaussian=use_gaussian,
+                                                                                         all_in_gpu=all_in_gpu,
+                                                                                         mixed_precision=self.fp16)[1]
 
-                softmax_pred = softmax_pred.transpose([0] + [i + 1 for i in self.transpose_backward])
+                    softmax_pred = softmax_pred.transpose([0] + [i + 1 for i in self.transpose_backward])
 
-                if save_softmax:
-                    softmax_fname = join(output_folder, fname + ".npz")
-                else:
-                    softmax_fname = None
+                    if save_softmax:
+                        softmax_fname = join(output_folder, fname + ".npz")
+                    else:
+                        softmax_fname = None
 
-                """There is a problem with python process communication that prevents us from communicating obejcts
-                larger than 2 GB between processes (basically when the length of the pickle string that will be sent is
-                communicated by the multiprocessing.Pipe object then the placeholder (\%i I think) does not allow for long
-                enough strings (lol). This could be fixed by changing i to l (for long) but that would require manually
-                patching system python code. We circumvent that problem here by saving softmax_pred to a npy file that will
-                then be read (and finally deleted) by the Process. save_segmentation_nifti_from_softmax can take either
-                filename or np.ndarray and will handle this automatically"""
-                if np.prod(softmax_pred.shape) > (2e9 / 4 * 0.85):  # *0.85 just to be save
-                    np.save(join(output_folder, fname + ".npy"), softmax_pred)
-                    softmax_pred = join(output_folder, fname + ".npy")
+                    """There is a problem with python process communication that prevents us from communicating obejcts
+                    larger than 2 GB between processes (basically when the length of the pickle string that will be sent is
+                    communicated by the multiprocessing.Pipe object then the placeholder (\%i I think) does not allow for long
+                    enough strings (lol). This could be fixed by changing i to l (for long) but that would require manually
+                    patching system python code. We circumvent that problem here by saving softmax_pred to a npy file that will
+                    then be read (and finally deleted) by the Process. save_segmentation_nifti_from_softmax can take either
+                    filename or np.ndarray and will handle this automatically"""
+                    if np.prod(softmax_pred.shape) > (2e9 / 4 * 0.85):  # *0.85 just to be save
+                        np.save(join(output_folder, fname + ".npy"), softmax_pred)
+                        softmax_pred = join(output_folder, fname + ".npy")
 
-                results.append(export_pool.starmap_async(save_segmentation_nifti_from_softmax,
-                                                         ((softmax_pred, join(output_folder, fname + ".nii.gz"),
-                                                           properties, interpolation_order, self.regions_class_order,
-                                                           None, None,
-                                                           softmax_fname, None, force_separate_z,
-                                                           interpolation_order_z),
-                                                          )
-                                                         )
-                               )
+                    results.append(export_pool.starmap_async(save_segmentation_nifti_from_softmax,
+                                                             ((softmax_pred, join(output_folder, fname + ".nii.gz"),
+                                                               properties, interpolation_order, self.regions_class_order,
+                                                               None, None,
+                                                               softmax_fname, None, force_separate_z,
+                                                               interpolation_order_z),
+                                                              )
+                                                             )
+                                   )
 
-            pred_gt_tuples.append([join(output_folder, fname + ".nii.gz"),
-                                   join(self.gt_niftis_folder, fname + ".nii.gz")])
+                pred_gt_tuples.append([join(output_folder, fname + ".nii.gz"),
+                                       join(self.gt_niftis_folder, fname + ".nii.gz")])
 
-        _ = [i.get() for i in results]
+            _ = [i.get() for i in results]
+        except Exception:
+            export_pool.terminate()
+            export_pool.join()
+            raise
+        else:
+            export_pool.close()
+            export_pool.join()
+
         self.print_to_log_file("finished prediction")
 
         # evaluate raw predictions

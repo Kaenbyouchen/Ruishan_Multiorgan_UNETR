@@ -53,6 +53,10 @@ class unetr_pp_trainer_amos_mri(Trainer_acdc):
         self.ds_loss_weights = None
         self.pin_memory = True
         self.load_pretrain_weight = False
+        # AMOS on CARC can hang during async nifti export with fork.
+        # Restrict this workaround to AMOS trainer only.
+        self.export_pool_context = "spawn"
+        self.export_pool_maxtasksperchild = 1
 
         self.load_plans_file()
 
