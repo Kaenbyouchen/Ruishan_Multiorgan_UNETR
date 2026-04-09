@@ -12,6 +12,7 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+import shutil
 from collections import OrderedDict
 from typing import Tuple
 
@@ -22,9 +23,12 @@ from fvcore.nn import FlopCountAnalysis
 from sklearn.model_selection import KFold
 from torch import nn
 from torch.cuda.amp import autocast
+from unetr_pp.evaluation.evaluator import NiftiEvaluator, run_evaluation
+from unetr_pp.inference.segmentation_export import save_segmentation_nifti_from_softmax
 from unetr_pp.network_architecture.initialization import InitWeights_He
 from unetr_pp.network_architecture.neural_network import SegmentationNetwork
 from unetr_pp.network_architecture.synapse.unetr_pp_synapse import UNETR_PP
+from unetr_pp.postprocessing.connected_components import determine_postprocessing
 from unetr_pp.training.data_augmentation.data_augmentation_moreDA import get_moreDA_augmentation
 from unetr_pp.training.data_augmentation.default_data_augmentation import default_2D_augmentation_params, \
     get_patch_size, default_3D_augmentation_params
@@ -53,10 +57,6 @@ class unetr_pp_trainer_amos_mri(Trainer_acdc):
         self.ds_loss_weights = None
         self.pin_memory = True
         self.load_pretrain_weight = False
-        # AMOS on CARC can hang during async nifti export with fork.
-        # Restrict this workaround to AMOS trainer only.
-        self.export_pool_context = "spawn"
-        self.export_pool_maxtasksperchild = 1
 
         self.load_plans_file()
 
@@ -89,8 +89,8 @@ class unetr_pp_trainer_amos_mri(Trainer_acdc):
 
             self.folder_with_preprocessed_data = join(self.dataset_directory,
                                                       self.plans['data_identifier'] + "_stage%d" % self.stage)
-            seeds_train = np.random.random_integers(0, 99999, self.data_aug_params.get('num_threads'))
-            seeds_val = np.random.random_integers(0, 99999, max(self.data_aug_params.get('num_threads') // 2, 1))
+            seeds_train = np.random.randint(0, 100000, self.data_aug_params.get('num_threads'))
+            seeds_val = np.random.randint(0, 100000, max(self.data_aug_params.get('num_threads') // 2, 1))
             if training:
                 self.dl_tr, self.dl_val = self.get_basic_generators()
                 if self.unpack_data:
@@ -165,15 +165,150 @@ class unetr_pp_trainer_amos_mri(Trainer_acdc):
                  step_size: float = 0.5, save_softmax: bool = True, use_gaussian: bool = True, overwrite: bool = True,
                  validation_folder_name: str = 'validation_raw', debug: bool = False, all_in_gpu: bool = False,
                  segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True):
+        """Fully sequential validation — avoids multiprocessing Pool deadlocks
+        that occur when spawn/fork workers interact with the CUDA runtime."""
         ds = self.network.do_ds
         self.network.do_ds = False
-        ret = super().validate(do_mirroring=do_mirroring, use_sliding_window=use_sliding_window, step_size=step_size,
-                               save_softmax=save_softmax, use_gaussian=use_gaussian,
-                               overwrite=overwrite, validation_folder_name=validation_folder_name, debug=debug,
-                               all_in_gpu=all_in_gpu, segmentation_export_kwargs=segmentation_export_kwargs,
-                               run_postprocessing_on_folds=run_postprocessing_on_folds)
+        current_mode = self.network.training
+        self.network.eval()
+
+        assert self.was_initialized, "must initialize, ideally with checkpoint (or train first)"
+        if self.dataset_val is None:
+            self.load_dataset()
+            self.do_split()
+
+        if segmentation_export_kwargs is None:
+            if 'segmentation_export_params' in self.plans.keys():
+                force_separate_z = self.plans['segmentation_export_params']['force_separate_z']
+                interpolation_order = self.plans['segmentation_export_params']['interpolation_order']
+                interpolation_order_z = self.plans['segmentation_export_params']['interpolation_order_z']
+            else:
+                force_separate_z = None
+                interpolation_order = 1
+                interpolation_order_z = 0
+        else:
+            force_separate_z = segmentation_export_kwargs['force_separate_z']
+            interpolation_order = segmentation_export_kwargs['interpolation_order']
+            interpolation_order_z = segmentation_export_kwargs['interpolation_order_z']
+
+        output_folder = join(self.output_folder, validation_folder_name)
+        maybe_mkdir_p(output_folder)
+        my_input_args = {'do_mirroring': do_mirroring,
+                         'use_sliding_window': use_sliding_window,
+                         'step_size': step_size,
+                         'save_softmax': save_softmax,
+                         'use_gaussian': use_gaussian,
+                         'overwrite': overwrite,
+                         'validation_folder_name': validation_folder_name,
+                         'debug': debug,
+                         'all_in_gpu': all_in_gpu,
+                         'segmentation_export_kwargs': segmentation_export_kwargs,
+                         }
+        save_json(my_input_args, join(output_folder, "validation_args.json"))
+
+        if do_mirroring:
+            if not self.data_aug_params['do_mirror']:
+                raise RuntimeError("We did not train with mirroring so you cannot do inference with mirroring enabled")
+            mirror_axes = self.data_aug_params['mirror_axes']
+        else:
+            mirror_axes = ()
+
+        pred_gt_tuples = []
+
+        for k in self.dataset_val.keys():
+            properties = load_pickle(self.dataset[k]['properties_file'])
+            fname = properties['list_of_data_files'][0].split("/")[-1][:-12]
+            if overwrite or (not isfile(join(output_folder, fname + ".nii.gz"))) or \
+                    (save_softmax and not isfile(join(output_folder, fname + ".npz"))):
+                data = np.load(self.dataset[k]['data_file'])['data']
+
+                print(k, data.shape)
+                data[-1][data[-1] == -1] = 0
+
+                softmax_pred = self.predict_preprocessed_data_return_seg_and_softmax(
+                    data[:-1],
+                    do_mirroring=do_mirroring,
+                    mirror_axes=mirror_axes,
+                    use_sliding_window=use_sliding_window,
+                    step_size=step_size,
+                    use_gaussian=use_gaussian,
+                    all_in_gpu=all_in_gpu,
+                    mixed_precision=self.fp16)[1]
+
+                softmax_pred = softmax_pred.transpose([0] + [i + 1 for i in self.transpose_backward])
+
+                if save_softmax:
+                    softmax_fname = join(output_folder, fname + ".npz")
+                else:
+                    softmax_fname = None
+
+                # Export nifti directly in main process — no subprocess Pool.
+                save_segmentation_nifti_from_softmax(
+                    softmax_pred, join(output_folder, fname + ".nii.gz"),
+                    properties, interpolation_order, self.regions_class_order,
+                    None, None,
+                    softmax_fname, None, force_separate_z,
+                    interpolation_order_z)
+
+            pred_gt_tuples.append([join(output_folder, fname + ".nii.gz"),
+                                   join(self.gt_niftis_folder, fname + ".nii.gz")])
+
+        self.print_to_log_file("finished prediction")
+
+        # Evaluate sequentially — avoid Pool inside aggregate_scores.
+        self.print_to_log_file("evaluation of raw predictions")
+        task = self.dataset_directory.split("/")[-1]
+        job_name = self.experiment_name
+
+        evaluator = NiftiEvaluator()
+        evaluator.set_labels(list(range(self.num_classes)))
+        all_scores = OrderedDict()
+        all_scores["all"] = []
+        all_scores["mean"] = OrderedDict()
+
+        for test_file, ref_file in pred_gt_tuples:
+            scores = run_evaluation((test_file, ref_file, evaluator, {}))
+            all_scores["all"].append(scores)
+            for label, score_dict in scores.items():
+                if label in ("test", "reference"):
+                    continue
+                if label not in all_scores["mean"]:
+                    all_scores["mean"][label] = OrderedDict()
+                for score, value in score_dict.items():
+                    if score not in all_scores["mean"][label]:
+                        all_scores["mean"][label][score] = []
+                    all_scores["mean"][label][score].append(value)
+
+        for label in all_scores["mean"]:
+            for score in all_scores["mean"][label]:
+                all_scores["mean"][label][score] = float(np.nanmean(all_scores["mean"][label][score]))
+
+        json_dict = OrderedDict()
+        json_dict["name"] = job_name + " val tiled %s" % (str(use_sliding_window))
+        json_dict["author"] = "Fabian"
+        json_dict["task"] = task
+        json_dict["results"] = all_scores
+        save_json(json_dict, join(output_folder, "summary.json"))
+
+        if run_postprocessing_on_folds:
+            self.print_to_log_file("determining postprocessing")
+            determine_postprocessing(self.output_folder, self.gt_niftis_folder, validation_folder_name,
+                                     final_subf_name=validation_folder_name + "_postprocessed", debug=debug)
+
+        gt_nifti_folder = join(self.output_folder_base, "gt_niftis")
+        maybe_mkdir_p(gt_nifti_folder)
+        for f in subfiles(self.gt_niftis_folder, suffix=".nii.gz"):
+            success = False
+            attempts = 0
+            while not success and attempts < 10:
+                try:
+                    shutil.copy(f, gt_nifti_folder)
+                    success = True
+                except OSError:
+                    attempts += 1
+
+        self.network.train(current_mode)
         self.network.do_ds = ds
-        return ret
 
     def predict_preprocessed_data_return_seg_and_softmax(self, data: np.ndarray, do_mirroring: bool = True,
                                                          mirror_axes: Tuple[int] = None,
